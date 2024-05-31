@@ -44,7 +44,9 @@ conda activate RNA_seq
 - Command:
     - bash RNA_seq <FASTQ_DIR> <REF_DIR> <RESULTS_DIR> <species> <aligner> <reads>
     - Example: 
-        - bash RNA_seq.sh /test/fastq_files /test/mm10_salmon /test/results "mm10" "salmon" "paired"
+    ```
+    bash RNA_seq.sh /test/fastq_files /test/mm10_salmon /test/results "mm10" "salmon" "paired"
+    ```
 
 - OUTPUT FOLDER:
     - fastQC                : quality control reports for all the fastq files
