@@ -23,6 +23,13 @@ This repo contains the scripts used for analysis of the Bulk-RNA sequencing anal
 - Pathway Analysis : 
     - msigDB 
 
+## CONDA ENVIRONMENT:
+- Create a new conda environment and installing tools needed for RNA_seq.sh script
+```
+conda create -f conda_envs/RNA_seq.yml
+conda activate RNA_seq
+```
+
 ## HOW TO RUN THE PIPELINE:
 - INPUT PATHS:
     - FASTQ_DIR   =</path/of/the/directory/containing/fastq/files>
