@@ -1,0 +1,366 @@
+---
+title: "Differential Analysis"
+format: html
+editor: visual
+execute:
+  echo: false
+  message: false
+---
+
+```{r Load Library,include=FALSE}
+library(data.table)
+library(tidyverse)
+library(conflicted)
+library(dplyr)
+```
+
+
+```{r read files,include=FALSE}
+#--List all directories containing data and get the files names--#
+samples <- list.files(path = "/Users/simra1/Desktop/Tavazoie_Lab/RNA_seq/results/salmon", full.names = T, pattern="_S*")
+files <- file.path(samples, "quant.sf")
+```
+
+### --- \* tximeta to import the reads\* ----
+
+-   Make sure that the sample table has these columns: names, files, condition
+
+```{r tximeta, include=FALSE}
+
+colfile <- read.csv("metadata/colon_tumor_all.csv")
+
+sample_df <- as.data.frame(colfile)  %>% rownames_to_column()
+sample_names <- str_replace(files, "/Users/simra1/Desktop/Tavazoie_Lab/RNA_seq/results/salmon/", "")  %>%  str_remove("/quant.sf")
+
+
+files_df <- as.data.frame(files) %>%
+  mutate(names = sample_names)
+salmondf  <- sample_df %>% left_join(files_df, by = ("names"="names"))
+
+library(tximeta)
+library(SummarizedExperiment)
+
+se_tximeta<-tximeta(salmondf)
+```
+
+### -- \* Summarize to Gene --\*
+
+```{r summarize_gene,echo=FALSE,message=FALSE}
+library(org.Mm.eg.db)
+gse <- summarizeToGene(se_tximeta)
+gse <- addIds(gse, column="SYMBOL")
+```
+
+
+### ----- \* DIFFERENTIAL GENE EXPRESSION \* -----
+
+log2 fold change (MLE)
+
+```{r DESeq2 1}
+library(DESeq2)
+dds <- DESeqDataSet(gse, design=~condition)
+```
+
+After creating the dataset, I perform some minimal filtering that makes sense for bulk RNA-seq. I filter such that there must be at least three samples with a count of 10 or more to keep the gene in the dataset. This will reduce the size of the dataset (here, removing more than half of the genes) and the time needed to fit various per-gene parameters, such as dispersion and fold change estimates.
+
+*DESeq2* computes a robust size factor which outperforms the total count in adjusting for differential sequence depth across libraries. Then *DESeq2* computes (iteratively) the coefficients of a generalized linear model (GLM), and a dispersion parameter that reflects the variation in addition to the Poisson variation, around the expected value for each sample conditioned on information in the design matrix.
+
+```{r DESeq 2}
+keep <- rowSums(counts(dds) >= 10) >= 3
+table(keep)
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+dds <- estimateSizeFactors(dds)
+# Extract the normalized counts
+normalized_counts <- counts(dds, normalized = TRUE)
+
+
+normalized_counts <- as.data.frame(normalized_counts)
+normalized_counts$SYMBOL <- mcols(dds)$SYMBOL
+
+# OR this will give you unnormalized values
+unNormalized_counts <- counts(dds, normalized = FALSE)
+unNormalized_counts <- as.data.frame(unNormalized_counts)
+unNormalized_counts$SYMBOL <- mcols(dds)$SYMBOL
+```
+
+One of the key estimates is the dispersion for each gene. *DESeq2* uses a combination of methods to estimate the dispersion. First, the gene-wise estimate is produced using the methods proposed by *edgeR* in 2012 for a Negative Binomial generalized linear model (GLM) . Briefly, the maximum adjusted profile likelihood estimate is calculated, where the adjustment of is used to avoid a downward bias on the dispersion estimate. This bias adjustment is similar in theory to the the use of 1n−11�−1 in estimating the sample variance.
+
+Below I plot the estimates over the mean of scaled counts for each gene. Note that many of the plots in *DESeq2* refer to "normalized counts"; here this just implies scaling the counts by the size factor, so that the differences affecting counts across samples are minimized.
+
+There are two per-gene estimates, an initial estimate which looks only at the data for a single gene (`gene-est`, black points), and a final estimate that incorporates information from each gene, as well as sharing information across genes (`final`, blue points). The blue circles at the top of the plot represent genes with high dispersion relative to the rest of the dataset, and in these cases, only the `gene-est` estimate is used, without information from other genes.
+
+```{r Dispersion Plot}
+plotDispEsts(dds, ylim=c(1e-3, .5), xlim=c(5,1e5))
+```
+
+```{r PCA}
+vsd <- vst(dds, blind=FALSE)
+plotPCA(vsd)
+```
+
+The genes with an adjusted p-value, padj, less than a threshold, say 0.1, provide a set that is expected to control its nominal FDR, for example no more than 10% of the genes in such a set on average should be false positives.
+
+```{r Summary of DESeq2, include=TRUE}
+resultsNames(dds)
+
+#Cre positive and cre negative
+res <- results(dds)
+summary(res)
+res$SYMBOL <- mcols(dds)$SYMBOL
+```
+
+I will compute a new estimate of fold change. The estimate in the results table above is the MLE, or maximum likelihood estimate, which is highly variable for low count genes (as we saw in the simulated example). Here I compute a Bayesian estimate for the fold change using methods in the apeglm package (27). The apeglm functions are wrapped up in a DESeq2 function called lfcShrink, which produces a table similar to results but with shrunken LFC instead of MLE.
+
+```{r Shrinkage}
+lfc <- lfcShrink(dds, coef = "condition_tumor_low_vs_tumor_ctrl", type="apeglm")
+```
+
+### --- *MA Plot for non shrinkage of log2fold change* ---
+
+```{r MA plot with res}
+plotMA(res, ylim=c(-3,3), 
+       colNonSig="grey60", colSig="blue", colLine="grey40")
+```
+
+###-- \* MA Plot for shrinkage \*---
+
+```{r MA plot with lfc}
+plotMA(lfc, ylim=c(-3,3), 
+       colNonSig="grey60", colSig="blue", colLine="grey40")
+```
+
+###--- \* Remove NA and duplicated genes \*---
+
+```{r}
+num = which(is.na(res$SYMBOL))
+res = res[-num, ]
+
+duplicate_genes <- which(duplicated(res$SYMBOL))
+res = res[-duplicate_genes,]
+
+```
+
+###--- \* Volcano Plot \*---
+
+```{r VolcanoPlot}
+library(EnhancedVolcano)
+pCutoff = 0.05
+FCcutoff = 1.5
+
+EnhancedVolcano(res, lab = as.character(res$SYMBOL), x = 'log2FoldChange', y = 'padj',
+                  xlab = bquote(~Log[2]~ 'fold change'),
+                  ylab = bquote(~-Log[10]~italic(padj)),
+                  pCutoff = pCutoff, 
+                  FCcutoff = FCcutoff, 
+                  pointSize = 1.0, 
+                  labSize = 2.0,
+                  title = "Volcano plot", 
+                  subtitle = "Tumor low vs ctrl",
+                  legendPosition = 'right', 
+                  #ylim = c(0, -log10(10e-12)),
+                  #xlim = c(-8,8),
+                  #ylim = c(0,10),
+                  legendLabSize = 8, legendIconSize = 3.0)
+
+```
+
+###--- \* Heatmap \*---
+
+```{r Heatmap}
+library(RColorBrewer)
+library(ComplexHeatmap)
+new_palette <- colorRampPalette(brewer.pal(9, "YlOrRd"))(100)
+condition_colors <- c("Tumor low" = "pink", "Tumor ctrl" = "green")
+
+
+
+top_genes <- head(res[order(res$pvalue), ], 15)
+trans <- rownames(top_genes)
+genes <- top_genes$SYMBOL
+
+heatmapData <- assay(vsd)[trans, ]
+rownames(heatmapData) <- genes
+heatmapData <- heatmapData[!is.na(rownames(heatmapData)), ]
+heatmapData <- t(scale(t(heatmapData)))
+
+
+
+# Create the heatmap
+heatmapColAnnot <- HeatmapAnnotation(condition = vsd$condition)
+Heatmap(heatmapData,
+        top_annotation = heatmapColAnnot,
+        cluster_rows = TRUE, cluster_columns = FALSE,
+        col = new_palette)
+```
+
+### --- \* Storing the differential gene expression results \*---
+
+```{r Storing the DEG results}
+tumor_low_vs_ctrl<- res
+tumor_low_vs_ctrl$sign_p <- -log10(tumor_low_vs_ctrl$pvalue) * sign(tumor_low_vs_ctrl$log2FoldChange)
+tumor_low_vs_ctrl<- tumor_low_vs_ctrl[order(tumor_low_vs_ctrl$sign_p, decreasing = T),]
+write.csv(tumor_low_vs_ctrl, file = 'results/res_tumor_low_vs_ctrl/deg_tumor_low_vs_ctrl.csv')
+
+```
+
+###--- \* Pathway Analysis \*----
+
+```{r Pathway Analysis}
+
+#--Pathway analysis--#
+library(msigdbr)
+library(fgsea)
+library(patchwork)
+library(stringr)
+
+this.category = "H"
+m_df <- msigdbr(species = "Mus musculus", category = this.category)
+fgsea_sets = m_df %>% split(x=.$gene_symbol, f=.$gs_name)
+
+
+fgseaplotter = function(top.table, upname, downname) {
+  # first do it for upregulated terms
+  ranks = top.table$log2FoldChange
+  names(ranks) = top.table$SYMBOL
+  fgseaRes = fgsea(fgsea_sets, stats = ranks, eps = 0)
+  toplot = fgseaRes %>% as.data.table
+  for (pway in 1:nrow(toplot)) {
+    toplot$count[pway] = length(toplot$leadingEdge[[pway]])
+  }
+  toplot$frac = toplot$count * 100 / toplot$size
+  toplot$padj = -log10(toplot$padj)
+  toplot$log10err = log10(2^toplot$log2err)
+  fwrite(toplot, paste0("results/res_tumor_low_vs_ctrl/",this.category,upname), sep = "\t")
+  toplot = toplot %>% 
+    arrange(padj) %>% 
+    mutate(pathway = gsub("_"," ",pathway)) %>% 
+    mutate(pathway = str_wrap(pathway, width = 30)) %>%
+    mutate(pathway = factor(pathway, unique(pathway)))
+  plot_up = ggplot(head(toplot[order(-NES)], n = 10), aes(x = padj, y = pathway)) +
+    geom_vline(xintercept = -log10(0.05), linetype = "longdash", size = 1) +
+    geom_point(aes(color = frac, size = size)) +
+    scale_size_continuous(range = c(5,9)) +
+    theme_bw() +
+    expand_limits(x=0) +
+    guides(size = guide_legend(order = 1),
+           color = guide_colorbar(order = 2)) +
+    labs(color="Fraction of Hits", y="Pathway", 
+         x=expression(-log[10](padj)), 
+         size="Count", 
+         title = paste0("Upregulated Terms, ",this.category, " MSigDB pathways"))
+  # then do it for downregulated terms
+  ranks = -top.table$log2FoldChange
+  names(ranks) = top.table$SYMBOL
+  fgseaRes = fgsea(fgsea_sets, stats = ranks, eps = 0)
+  toplot = fgseaRes %>% as.data.table
+  for (pway in 1:nrow(toplot)) {
+    toplot$count[pway] = length(toplot$leadingEdge[[pway]])
+  }
+  toplot$frac = toplot$count * 100 / toplot$size
+  toplot$padj = -log10(toplot$padj)
+  toplot$log10err = log10(2^toplot$log2err)
+  fwrite(toplot, paste0("results/res_tumor_low_vs_ctrl/",this.category,downname), sep = "\t")
+  toplot = toplot %>% 
+    arrange(padj) %>% 
+    mutate(pathway = gsub("_"," ",pathway)) %>% 
+    mutate(pathway = str_wrap(pathway, width = 30)) %>%
+    mutate(pathway = factor(pathway, unique(pathway)))
+  plot_dn = ggplot(head(toplot[order(-NES)], n = 10), aes(x = padj, y = pathway)) +
+    geom_vline(xintercept = -log10(0.05), linetype = "longdash", size = 1) +
+    geom_point(aes(color = frac, size = size)) +
+    scale_size_continuous(range = c(5,9)) +
+    theme_bw() +
+    expand_limits(x=0) +
+    guides(size = guide_legend(order = 1),
+           color = guide_colorbar(order = 2)) +
+    labs(color="Fraction of Hits", y="Pathway", 
+         x=expression(-log[10](padj)), 
+         size="Count", 
+         title = paste0("Downregulated Terms, ",this.category, " MSigDB pathways"))
+  return(plot_dn | plot_up)
+}
+```
+
+```{r}
+tumor_low_vs_ctrl_tab = read.csv("results/res_tumor_low_vs_ctrl/deg_tumor_low_vs_ctrl.csv")
+fgseaplotter(tumor_low_vs_ctrl_tab,"_up.txt","_down.txt") %>% 
+  ggsave(paste0("results/res_tumor_low_vs_ctrl/",this.category,"_pathway.png"),.,width=14,height=7,dpi=400)
+```
+
+#---- Pathway Analysis ----#
+
+```{r}
+library(msigdbr)
+library(fgsea)
+library(patchwork)
+library(stringr)
+
+#GSEA with hallmark gene set
+GSEA_input <- res$sign_p; names(GSEA_input) = res$SYMBOL
+
+
+GSEA_input[which(is.infinite(GSEA_input))] = sign(GSEA_input[which(is.infinite(GSEA_input))])*300
+GSEA_input <- na.omit(GSEA_input)
+
+GSEA_input = GSEA_input[order(GSEA_input, decreasing = T)]
+
+
+hall_mark_gene_set = msigdbr(species = "Mus musculus", category = 'H')
+hall_mark_gene_set = hall_mark_gene_set %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(pathways = hall_mark_gene_set, stats =  GSEA_input, nperm=10000)
+fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = F),]
+
+#visualize hallmark
+fgseaRes = fgseaRes[order(fgseaRes$NES, decreasing = T),]
+fgseaRes$pathway <- factor(fgseaRes$pathway, levels = rev(fgseaRes$pathway))
+ggplot(fgseaRes[1:10,1:7],
+       aes(x = NES, y = pathway)) + 
+  geom_point(aes(size = size, color = padj)) +
+  theme_bw(base_size = 14) +
+  scale_colour_gradient(limits=c(0, 0.10), low="red") +
+  ylab(NULL) +
+  ggtitle("Tumor low vs Tumor ctrl")
+
+```
+
+```{r}
+fgseaRes = fgseaRes[order(fgseaRes$NES, decreasing = T),]
+fgseaRes = fgseaRes[which(fgseaRes$padj < 0.1),]
+fgseaRes$pathway = gsub('_', ' ', tolower(fgseaRes$pathway), fixed = T)
+fgseaRes$pathway = gsub('hallmark ', '', tolower(fgseaRes$pathway), fixed = T)
+fgseaRes$pathway = str_to_sentence(fgseaRes$pathway)
+fgseaRes$pathway <- factor(fgseaRes$pathway, levels = rev(fgseaRes$pathway))
+ggplot(fgseaRes[,1:7],
+       aes(x = NES, y = pathway)) + 
+  geom_point(aes(size = size, color = padj), alpha = 0.99) +
+  geom_segment(aes(x=0, y=pathway, xend=NES, yend=pathway, color=padj)) +
+  theme_classic(base_size = 14) +
+  scale_colour_gradient(limits=c(0, 0.1), low="#d6604d") +
+  ylab(NULL) +
+  ggtitle("Tumor low vs Tumor ctrl")
+
+```
+
+```{r}
+fgseaRes$nlog10_padj <- -log10(fgseaRes$padj)
+
+p <- ggplot(fgseaRes, aes(y = pathway, x = NES, fill = nlog10_padj)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Pathway Analysis ", y = "Pathway tumor_low_vs_ctrl", x = "NES Score") +
+  scale_fill_gradient(trans = "log10", low = "blue", high = "red") +  # Apply log10 transformation
+  theme_minimal() +
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank(),  # Remove minor grid lines
+        axis.text = element_text(size = 10, family = "Helvetica",face = "bold"),  # Increase axis text size
+        axis.title = element_text(size = 14, face = "bold", family = "Helvetica"),
+        axis.line = element_line(color = "black", size = 0.5), 
+        axis.ticks = element_line(color = "black", size = 0.5))
+        
+
+print(p)
+# Set axis line properties
+```
